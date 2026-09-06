@@ -18,6 +18,7 @@ import csv
 import math
 import os
 import re
+from decimal import Decimal
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -219,10 +220,24 @@ def get_current_run() -> RunState:
 
 
 def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalise blank-ish values to None so DuckDB and Plotly behave predictably."""
-    df = df.replace(r"^\s*$", None, regex=True)
-    df = df.replace(["nan", "NaN", "null", "NULL", "None"], None)
-    df = df.where(pd.notnull(df), None)
+    """Normalise blank-ish placeholder strings so DuckDB and Plotly behave predictably.
+
+    Numeric columns keep their native NaN - DuckDB reads that as NULL correctly, and
+    forcing None into a float column just becomes NaN again. Anything crossing the
+    wire to the model is sanitised separately by `json_safe`.
+    """
+    # Select by exclusion: pandas 2 stores text as `object`, pandas 3 as `str`, so
+    # testing for a specific text dtype silently matches nothing on one of them.
+    text_cols = [
+        c
+        for c in df.columns
+        if not pd.api.types.is_numeric_dtype(df[c])
+        and not pd.api.types.is_datetime64_any_dtype(df[c])
+        and not pd.api.types.is_bool_dtype(df[c])
+    ]
+    if text_cols:
+        df[text_cols] = df[text_cols].replace(r"^\s*$", None, regex=True)
+        df[text_cols] = df[text_cols].replace(["nan", "NaN", "null", "NULL", "None"], None)
     return df
 
 
@@ -506,19 +521,60 @@ def load_datasets(path: str, display_name: str, auto_detect: bool = True) -> lis
     return out
 
 
+def _clean_scalar(value: Any) -> Any:
+    """Coerce one cell into something `json.dumps(..., allow_nan=False)` accepts.
+
+    Operating on values rather than DataFrames is deliberate. `df.where(notna, None)`
+    looks like it removes NaN, but on a float column pandas stores None back as NaN,
+    so the scrub silently does nothing and the NaN reaches the JSON encoder - which
+    emits a bare `NaN` token that the Gemini API rejects with a 400.
+    """
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+    if isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.isoformat()
+    if hasattr(value, "isoformat"):  # date, time, datetime
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return _clean_scalar(float(value))
+    if hasattr(value, "item"):  # numpy scalar -> python scalar, then re-check
+        try:
+            return _clean_scalar(value.item())
+        except (ValueError, AttributeError):
+            return str(value)
+    try:
+        if pd.isna(value):  # pd.NA and friends
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (list, tuple, set)):
+        return [_clean_scalar(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _clean_scalar(v) for k, v in value.items()}
+    return str(value)
+
+
+def json_safe(obj: Any) -> Any:
+    """Recursively sanitise a tool's return value before it goes back to the model."""
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    return _clean_scalar(obj)
+
+
 def _jsonable_rows(df: pd.DataFrame, limit: int) -> list[dict]:
     """Rows safe to hand back to the model: no NaN, no inf, no numpy scalars."""
-    out = df.head(limit).copy()
-    out = out.replace([float("inf"), float("-inf")], None)
-    out = out.where(pd.notna(out), None)
-    records = out.to_dict(orient="records")
-    for row in records:
-        for key, val in row.items():
-            if hasattr(val, "item"):
-                row[key] = val.item()
-            elif isinstance(val, pd.Timestamp):
-                row[key] = val.isoformat()
-    return records
+    records = df.head(limit).to_dict(orient="records")
+    return [{str(k): _clean_scalar(v) for k, v in row.items()} for row in records]
 
 
 # --------------------------------------------------------------------------------------
@@ -567,14 +623,14 @@ def preview_data_sources(tool_context: ToolContext) -> dict:
     )
 
     tool_context.state["tables"] = {t["table"]: t["columns"] for t in tables}
-    return {
+    return json_safe({
         "tables": tables,
         "note": (
             "Query these using their `table` name. The first table is also aliased as `data`."
             if len(tables) > 1
             else "Query this table by its `table` name, or as `data`."
         ),
-    }
+    })
 
 
 def run_sql_query(query: str, tool_context: ToolContext) -> dict:
@@ -623,13 +679,15 @@ def run_sql_query(query: str, tool_context: ToolContext) -> dict:
     tool_context.state["last_query"] = query.strip()
     tool_context.state["last_result_columns"] = [str(c) for c in result.columns]
 
-    return {
-        "columns": [str(c) for c in result.columns],
-        "row_count": int(len(result)),
-        "rows_preview": _jsonable_rows(result, MAX_ROWS_TO_MODEL),
-        "truncated": truncated,
-        "note": "The full result is held in memory. Pass column names to create_visualization.",
-    }
+    return json_safe(
+        {
+            "columns": [str(c) for c in result.columns],
+            "row_count": int(len(result)),
+            "rows_preview": _jsonable_rows(result, MAX_ROWS_TO_MODEL),
+            "truncated": truncated,
+            "note": "The full result is held in memory. Pass column names to create_visualization.",
+        }
+    )
 
 
 def create_visualization(
@@ -849,7 +907,7 @@ def create_visualization(
         "color": color,
         "title": title,
     }
-    return {"status": "success", "plot_type": plot_type, "points": int(len(df))}
+    return json_safe({"status": "success", "plot_type": plot_type, "points": int(len(df))})
 
 
 # --------------------------------------------------------------------------------------

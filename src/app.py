@@ -34,7 +34,10 @@ st.set_page_config(page_title="Text to Visualization", page_icon="📊", layout=
 
 MODEL_CHOICES = [
     "gemini-flash-latest",
-    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
 ]
 
 

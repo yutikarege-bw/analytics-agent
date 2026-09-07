@@ -15,8 +15,10 @@ Differences vs. the original notebook:
 from __future__ import annotations
 
 import csv
+import math
 import os
 import re
+from decimal import Decimal
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -50,49 +52,81 @@ DEFAULT_REFINE_MODEL = os.getenv("VIZ_REFINE_MODEL", "gemini-flash-latest")
 MAX_RESULT_ROWS = 5000  # hard cap on rows pulled out of DuckDB
 MAX_ROWS_TO_MODEL = 50  # rows echoed back to Gemini (the chart reads the full frame)
 
-REFINE_SYSTEM_INSTRUCTION = """You are an assistant that reformulates user queries into structured prompts for data analysis and visualization.
-Always follow these steps:
-1. Identify the key data points, dimensions, metrics, filters, or chart types mentioned in the user's query.
-2. Reformulate the user's input into a clear, concise, and structured prompt that can be accurately interpreted by an LLM.
-3. Ensure that all data points, relationships, and visualization intents from the original request are preserved in the final reformulated prompt and will be included in the visualization.
-4. If any part of the user's request is ambiguous or vague, make reasonable assumptions but preserve intent.
-5. When a TOTAL value is mentioned, you MUST include it in the visualization. You MUST NOT include a total when it is not mentioned. For example: "how the **total** is split between..." means the total must be present in the visualization.
-Return only the reformulated prompt, with no preamble."""
+REFINE_SYSTEM_INSTRUCTION = """You reformulate user messages into structured prompts for data analysis and visualization.
 
-AGENT_INSTRUCTION = """You turn questions about uploaded spreadsheets into a single Plotly chart.
+FIRST decide whether the message is an analytical request about a dataset.
+If it is NOT - a greeting, thanks, chit-chat, a question about the assistant itself, a
+vague follow-up like "now as a pie chart", or anything with nothing to restructure -
+return the message EXACTLY as written, unchanged. Do not expand it, do not add
+assumptions, do not turn it into a data question.
 
-Follow these steps in order. Do not skip any.
+If it IS an analytical request:
+1. Identify the key data points, dimensions, metrics, filters, or chart types mentioned.
+2. Reformulate it into a clear, concise, structured prompt another model can act on.
+3. Preserve every data point, relationship and visualization intent from the original.
+4. Where the request is ambiguous, make reasonable assumptions but preserve intent.
+5. Do not invent a chart request. If the user asked a question in words, keep it a
+   question in words - only mention a chart if they asked for one.
+6. When a TOTAL is mentioned, it must appear in the output. When it is not mentioned,
+   do not add one.
 
-1. Call `preview_data_sources` first. It returns every available table with its exact
-   SQL table name, real column names and dtypes. Match the user's wording to actual
-   table and column names, and state the mapping you chose in one short line.
+Return only the resulting prompt, with no preamble or commentary."""
 
-2. Call `run_sql_query` with a DuckDB SQL query.
-   - Use the exact `table` names from the preview in your FROM clause. Several files,
-     and several sheets of one workbook, can be loaded at once - join across them when
-     the question needs it.
-   - The first table is also aliased as `data`.
-   - Quote column names containing spaces with double quotes: SELECT "Product Area" FROM sales
-   - Produce LONG format, one row per (category, series, value). If the source is wide,
-     unpivot it in SQL with UNION ALL or UNPIVOT rather than reshaping it yourself.
-   - Filter out NULL/empty category values when building a stacked or 100% stacked bar.
-   - Aggregate in SQL (GROUP BY) so the result is chart-sized, not raw rows.
+AGENT_INSTRUCTION = """You are a data analyst assistant. The user has uploaded spreadsheets, and each
+turn tells you which tables and columns are currently loaded.
 
-3. Call `create_visualization`. It reads the result of the last `run_sql_query`
-   automatically, so you only pass column names and chart options - never the data.
-   - `x`, `y`, and `color` must be column names present in the SQL result.
-   - Use the chart type the user asked for. For a Sankey, pass `source`, `target`
-     and `value` instead of `y`. For a heatmap, pass the numeric value column as
-     `color`. Use `100%_single_stacked_bar` when the user wants one bar showing how
-     a single total splits across categories.
-   - Supported `plot_type` values: line, bar, stacked_bar, 100%_stacked_bar,
-     100%_single_stacked_bar, scatter, box, histogram, pie, heatmap, sankey.
+FIRST decide what kind of reply the message needs:
 
-4. When the chart tool reports success, reply with two or three sentences describing
-   what the chart shows and the mapping you used. Then stop. Do not call more tools.
+A. CONVERSATION - greetings, thanks, "what can you do", questions about your own
+   behaviour, or anything not about the data. Just reply in plain language.
+   Call no tools at all.
 
-Limits: call any single tool at most 3 times per request. If a tool keeps failing,
-stop and explain the problem plainly instead of guessing at new table or column names."""
+B. ANALYSIS IN WORDS - a question about the data whose answer is a number, a list, a
+   comparison, an explanation, or a "what's in this file" overview. Query the data and
+   answer in prose. Do NOT make a chart.
+
+C. CHART - the user asks to see, plot, draw, graph, visualise, or explicitly names a
+   chart type. Query the data, then call `create_visualization`.
+
+If a data question is ambiguous between B and C, answer in words and offer a chart at
+the end rather than making one uninvited. Never make a chart for a question that was
+already fully answered by a sentence.
+
+Tools:
+
+- `preview_data_sources` gives sample values, dtypes and exact column names. Call it
+  when you need to see actual values or aren't sure what a column contains. You do not
+  need it for a simple lookup if the table catalogue above already names the column.
+
+- `run_sql_query` runs DuckDB SQL. Use the exact `table` names from the catalogue in
+  your FROM clause. Several files, and several blocks of one sheet, can be loaded at
+  once - join across them when the question needs it. The first table is also aliased
+  as `data`.
+  - Quote column names containing spaces or symbols: SELECT "FY-1 Payment (EUR)" FROM input
+  - If tables carry a `row_id` column, they came from side-by-side blocks of one sheet
+    and are row-aligned: join them on `row_id` to line their values back up.
+  - Aggregate in SQL (GROUP BY) so the result is answer-sized, not raw rows.
+  - For a chart, return LONG format: one row per (category, series, value). If the
+    source is wide, unpivot in SQL with UNION ALL or UNPIVOT.
+  - Exclude NULL/empty categories when building a stacked or 100% stacked bar.
+
+- `create_visualization` reads the result of the most recent `run_sql_query`
+  automatically, so you pass only column names and chart options, never the data.
+  - `x`, `y` and `color` must be column names present in that SQL result.
+  - For a Sankey pass `source`, `target` and `value` instead of `y`. For a heatmap pass
+    the numeric value column as `color`. Use `100%_single_stacked_bar` for one bar
+    showing how a single total splits across categories.
+  - Supported `plot_type`: line, bar, stacked_bar, 100%_stacked_bar,
+    100%_single_stacked_bar, scatter, box, histogram, pie, heatmap, sankey.
+
+Answering: state the numbers you found, with thousands separators and the unit from the
+column name. Say in one short line which tables and columns you used, so the user can
+check you matched their wording correctly. Keep it to a few sentences unless asked for
+more.
+
+If the data cannot answer the question, say so plainly and name what is missing. Do not
+invent columns. Call any single tool at most 3 times per request; if it keeps failing,
+stop and explain the problem."""
 
 
 # --------------------------------------------------------------------------------------
@@ -112,6 +146,8 @@ class Dataset:
     df: pd.DataFrame
     source: str  # original file name
     sheet: str = ""  # sheet name, for Excel
+    label: str = ""  # title found above the block within the sheet
+    note: str = ""  # how the table was located
 
 
 @dataclass
@@ -119,6 +155,7 @@ class RunState:
     """Everything a single agent run produced, for the UI to render."""
 
     datasets: list[Dataset] = field(default_factory=list)
+    previous_result: Optional[pd.DataFrame] = None  # last turn's SQL result
     preview: Optional[pd.DataFrame] = None
     queries: list[str] = field(default_factory=list)
     tables: list[pd.DataFrame] = field(default_factory=list)
@@ -128,7 +165,8 @@ class RunState:
 
     @property
     def last_table(self) -> Optional[pd.DataFrame]:
-        return self.tables[-1] if self.tables else None
+        """This turn's latest result, falling back to the previous turn's."""
+        return self.tables[-1] if self.tables else self.previous_result
 
     @property
     def table_names(self) -> list[str]:
@@ -137,15 +175,23 @@ class RunState:
     def note(self, message: str) -> None:
         self.log.append(message)
 
-    def add(self, df: pd.DataFrame, source: str, sheet: str = "") -> Dataset:
+    def add(
+        self, df: pd.DataFrame, source: str, sheet: str = "", label: str = "", note: str = ""
+    ) -> Dataset:
         """Register a DataFrame under a unique SQL-safe table name."""
-        base = sanitize_table_name(sheet or os.path.splitext(source)[0])
-        if sheet and any(d.table == base for d in self.datasets):
-            base = sanitize_table_name(f"{os.path.splitext(source)[0]}_{sheet}")
+        stem = os.path.splitext(source)[0]
+        if label and sheet:
+            base = sanitize_table_name(f"{sheet}_{label[:24]}")
+        else:
+            base = sanitize_table_name(label[:24] if label else (sheet or stem))
+        # Same sheet name in two different files: disambiguate with the file stem.
+        clash = next((d for d in self.datasets if d.table == base), None)
+        if clash is not None and clash.source != source:
+            base = sanitize_table_name(f"{stem}_{sheet or label}")
         name, n = base, 2
         while any(d.table == name for d in self.datasets):
             name, n = f"{base}_{n}", n + 1
-        dataset = Dataset(table=name, df=df, source=source, sheet=sheet)
+        dataset = Dataset(table=name, df=df, source=source, sheet=sheet, label=label, note=note)
         self.datasets.append(dataset)
         return dataset
 
@@ -174,15 +220,29 @@ def get_current_run() -> RunState:
 
 
 def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalise blank-ish values to None so DuckDB and Plotly behave predictably."""
-    df = df.replace(r"^\s*$", None, regex=True)
-    df = df.replace(["nan", "NaN", "null", "NULL", "None"], None)
-    df = df.where(pd.notnull(df), None)
+    """Normalise blank-ish placeholder strings so DuckDB and Plotly behave predictably.
+
+    Numeric columns keep their native NaN - DuckDB reads that as NULL correctly, and
+    forcing None into a float column just becomes NaN again. Anything crossing the
+    wire to the model is sanitised separately by `json_safe`.
+    """
+    # Select by exclusion: pandas 2 stores text as `object`, pandas 3 as `str`, so
+    # testing for a specific text dtype silently matches nothing on one of them.
+    text_cols = [
+        c
+        for c in df.columns
+        if not pd.api.types.is_numeric_dtype(df[c])
+        and not pd.api.types.is_datetime64_any_dtype(df[c])
+        and not pd.api.types.is_bool_dtype(df[c])
+    ]
+    if text_cols:
+        df[text_cols] = df[text_cols].replace(r"^\s*$", None, regex=True)
+        df[text_cols] = df[text_cols].replace(["nan", "NaN", "null", "NULL", "None"], None)
     return df
 
 
 def sanitize_table_name(raw: str) -> str:
-    """Turn a file or sheet name into something safe to type in a FROM clause."""
+    """Turn a file, sheet or block label into something safe to type in a FROM clause."""
     name = re.sub(r"\W+", "_", str(raw).strip().lower()).strip("_")
     if not name:
         name = "table"
@@ -191,27 +251,193 @@ def sanitize_table_name(raw: str) -> str:
     return name[:48]
 
 
-def _tidy(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip column names, drop fully-empty columns and rows, normalise blanks."""
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    # Excel exports routinely carry trailing unnamed columns and blank rows.
-    df = df.loc[:, ~df.columns.str.match(r"^Unnamed:\s*\d+$", na=False) | df.notna().any()]
-    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+@dataclass
+class LoadedTable:
+    """One table extracted from a file: a CSV, a sheet, or a block within a sheet."""
+
+    df: pd.DataFrame
+    sheet: str = ""
+    label: str = ""  # title found above the block, e.g. "Question 2:"
+    note: str = ""  # how it was found, shown in the UI
+
+
+def _is_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if value is pd.NaT:
+        return True
+    return isinstance(value, str) and not value.strip()
+
+
+def _is_numberish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)) and not (isinstance(value, float) and math.isnan(value)):
+        return True
+    if isinstance(value, str):
+        try:
+            float(value.replace(",", "").replace("%", "").strip())
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _runs(flags: list[bool]) -> list[list[int]]:
+    """Index runs where flags is True, e.g. [T,T,F,T] -> [[0,1],[3]]."""
+    out: list[list[int]] = []
+    current: list[int] = []
+    for i, flag in enumerate(flags):
+        if flag:
+            current.append(i)
+        elif current:
+            out.append(current)
+            current = []
+    if current:
+        out.append(current)
+    return out
+
+
+def _dedupe_columns(names: list[str]) -> list[str]:
+    """DuckDB rejects duplicate column names; suffix repeats."""
     seen: dict[str, int] = {}
-    columns = []
-    for col in df.columns:  # DuckDB rejects duplicate column names
-        if col in seen:
-            seen[col] += 1
-            columns.append(f"{col}_{seen[col]}")
+    out = []
+    for name in names:
+        if name in seen:
+            seen[name] += 1
+            out.append(f"{name}_{seen[name]}")
         else:
-            seen[col] = 0
-            columns.append(col)
-    df.columns = columns
-    return preprocess_dataframe(df.reset_index(drop=True))
+            seen[name] = 0
+            out.append(name)
+    return out
 
 
-def read_csv_robust(path: str) -> pd.DataFrame:
+def _detect_header(block: pd.DataFrame, mask: pd.DataFrame) -> tuple[Optional[int], str]:
+    """Find the header row of a block, plus any title text sitting above it.
+
+    A header row is mostly-filled, mostly non-numeric, and sits directly above a body
+    whose numeric columns are actually numeric. Rows above it (a stray "Question 2:"
+    title, a note, a merged banner) become the block's label.
+    """
+    n_rows = len(block)
+    if n_rows == 0:
+        return None, ""
+
+    look = min(15, n_rows)
+    tail = block.iloc[min(look, n_rows - 1) :] if n_rows > look else block
+    if tail.empty:
+        tail = block
+
+    # Which columns does the body treat as numeric?
+    numeric_cols = []
+    for pos in range(block.shape[1]):
+        values = [v for v in tail.iloc[:, pos] if not _is_blank(v)]
+        if values and sum(_is_numberish(v) for v in values) / len(values) > 0.7:
+            numeric_cols.append(pos)
+
+    candidates = []
+    for i in range(look):
+        fill = mask.iloc[i].mean()
+        if fill < 0.6:
+            continue  # a sparse row is a title, not a header
+        row = block.iloc[i]
+        cells = [v for v in row if not _is_blank(v)]
+        if not cells:
+            continue
+        texty = sum(isinstance(v, str) and not _is_numberish(v) for v in cells) / len(cells)
+        if texty < 0.6:
+            continue
+        if numeric_cols:
+            # A real header sits above numbers: its cells in numeric columns are text.
+            clashes = sum(1 for pos in numeric_cols if _is_numberish(block.iloc[i, pos]))
+            if clashes > len(numeric_cols) * 0.3:
+                continue
+        candidates.append(i)
+
+    if not candidates:
+        return None, _label_from_rows(block, mask, 0)
+
+    # The last qualifying row before the body: handles a title row that is also all text.
+    header_idx = candidates[-1] if numeric_cols else candidates[0]
+    return header_idx, _label_from_rows(block, mask, header_idx)
+
+
+def _label_from_rows(block: pd.DataFrame, mask: pd.DataFrame, stop: int) -> str:
+    """First meaningful text in the rows above the header - the block's title."""
+    for i in range(min(stop, len(block))):
+        for value in block.iloc[i]:
+            if isinstance(value, str) and value.strip() and not _is_numberish(value):
+                return value.strip().rstrip(":")[:60]
+    return ""
+
+
+def _finalize(frame: pd.DataFrame) -> pd.DataFrame:
+    """Trim, drop empty rows/columns, normalise blanks."""
+    frame = frame.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    frame.columns = [str(c).strip() for c in frame.columns]
+    frame = frame.loc[:, [bool(c) for c in frame.columns]]
+    frame.columns = _dedupe_columns(list(frame.columns))
+    return preprocess_dataframe(frame)  # index preserved: carries the sheet row number
+
+
+def extract_tables(raw: pd.DataFrame, split_columns: bool = True) -> list[LoadedTable]:
+    """Split a raw headerless grid into the rectangular tables it actually contains.
+
+    Real workbooks put several tables side by side on one sheet, separated by blank
+    spacer columns, each under its own title. Blank rows and columns are the separators,
+    so group on them and detect a header inside each resulting rectangle.
+    """
+    if raw.empty:
+        return []
+
+    mask = raw.map(lambda v: not _is_blank(v))
+    col_groups = (
+        _runs(list(mask.any(axis=0)))
+        if split_columns
+        else [[i for i in range(raw.shape[1]) if mask.iloc[:, i].any()]]
+    )
+
+    tables: list[LoadedTable] = []
+    for cols in col_groups:
+        if not cols:
+            continue
+        sub, sub_mask = raw.iloc[:, cols], mask.iloc[:, cols]
+        for rows in _runs(list(sub_mask.any(axis=1))):
+            if len(rows) < 2:  # a lone stray cell is not a table
+                continue
+            block, block_mask = sub.iloc[rows], sub_mask.iloc[rows]
+            header_idx, label = _detect_header(block.reset_index(drop=True), block_mask.reset_index(drop=True))
+
+            if header_idx is None:
+                frame = block.reset_index(drop=True)
+                frame.columns = [f"col_{i + 1}" for i in range(frame.shape[1])]
+                note = "no header row found - columns named col_1, col_2, ..."
+            else:
+                body = block.iloc[header_idx + 1 :]
+                if body.empty:
+                    continue
+                frame = body.reset_index(drop=True)
+                names = [
+                    str(v).strip() if not _is_blank(v) else f"col_{i + 1}"
+                    for i, v in enumerate(block.iloc[header_idx])
+                ]
+                frame.columns = names
+                note = f"header taken from row {rows[header_idx] + 1} of the sheet"
+
+            frame = _finalize(frame)
+            if frame.empty or not len(frame.columns):
+                continue
+            frame.attrs["sheet_rows"] = [int(i) + 1 for i in frame.index]
+            tables.append(LoadedTable(df=frame.reset_index(drop=True), label=label, note=note))
+
+            if len(tables) >= 20:  # guard against pathological sheets
+                return tables
+    return tables
+
+
+def read_csv_robust(path: str, header: Any = 0) -> pd.DataFrame:
     """Read a delimited file without assuming UTF-8 or commas.
 
     Real-world exports are semicolon-separated (European Excel), Latin-1 encoded, or
@@ -234,11 +460,11 @@ def read_csv_robust(path: str) -> pd.DataFrame:
             sep = ","
 
         try:
-            return pd.read_csv(path, sep=sep, encoding=encoding)
+            return pd.read_csv(path, sep=sep, encoding=encoding, header=header)
         except (pd.errors.ParserError, UnicodeDecodeError) as exc:
             last_error = exc
             try:  # engine="python" with sep=None infers the delimiter itself
-                return pd.read_csv(path, sep=None, engine="python", encoding=encoding)
+                return pd.read_csv(path, sep=None, engine="python", encoding=encoding, header=header)
             except Exception as exc2:  # noqa: BLE001 - retried under the next encoding
                 last_error = exc2
                 continue
@@ -246,43 +472,109 @@ def read_csv_robust(path: str) -> pd.DataFrame:
     raise ValueError(f"Could not parse '{os.path.basename(path)}' as delimited text: {last_error}")
 
 
-def load_datasets(path: str, display_name: str) -> list[tuple[pd.DataFrame, str]]:
-    """Read one uploaded file into [(dataframe, sheet_name)].
+def load_datasets(path: str, display_name: str, auto_detect: bool = True) -> list[LoadedTable]:
+    """Read one uploaded file into a list of queryable tables.
 
-    A CSV yields one frame. A workbook yields one frame per non-empty sheet, so the
-    agent can query - and join - every sheet without the user picking one up front.
+    With auto_detect on, each sheet is scanned for the tables it actually contains -
+    leading blank rows, floating titles and side-by-side blocks are handled. With it
+    off, each sheet is read straight through with the first row as the header.
     """
     lower = display_name.lower()
+    is_delimited = lower.endswith((".csv", ".tsv", ".txt"))
 
-    if lower.endswith(".tsv"):
-        return [(_tidy(pd.read_csv(path, sep="\t")), "")]
-    if lower.endswith(".csv") or lower.endswith(".txt"):
-        return [(_tidy(read_csv_robust(path)), "")]
+    if is_delimited:
+        if not auto_detect:
+            frame = pd.read_csv(path, sep="\t") if lower.endswith(".tsv") else read_csv_robust(path)
+            return [LoadedTable(df=_finalize(frame), note="first row used as header")]
+        raw = (
+            pd.read_csv(path, sep="\t", header=None)
+            if lower.endswith(".tsv")
+            else read_csv_robust(path, header=None)
+        )
+        # Delimited files are one table; only strip preamble rows, never split columns.
+        tables = extract_tables(raw, split_columns=False)
+        return tables or [LoadedTable(df=_finalize(raw), note="raw grid")]
 
     book = pd.ExcelFile(path)
-    out: list[tuple[pd.DataFrame, str]] = []
+    out: list[LoadedTable] = []
     for sheet in book.sheet_names:
-        frame = _tidy(book.parse(sheet))
-        if not frame.empty and len(frame.columns):
-            out.append((frame, str(sheet)))
+        if auto_detect:
+            raw = book.parse(sheet, header=None)
+            found = extract_tables(raw)
+            for table in found:
+                table.sheet = str(sheet)
+                if len(found) > 1:
+                    # Side-by-side blocks are row-aligned in the sheet, but splitting
+                    # them loses that. row_id preserves the link so they can be joined.
+                    rows = table.df.attrs.get("sheet_rows")
+                    if rows and len(rows) == len(table.df):
+                        table.df.insert(0, "row_id", rows)
+                        table.note += "; row_id = sheet row, join blocks from this sheet on it"
+            out.extend(found)
+        else:
+            frame = _finalize(book.parse(sheet))
+            if not frame.empty and len(frame.columns):
+                out.append(LoadedTable(df=frame, sheet=str(sheet), note="first row used as header"))
+
     if not out:
         raise ValueError(f"'{display_name}' has no sheet with usable data.")
     return out
 
 
+def _clean_scalar(value: Any) -> Any:
+    """Coerce one cell into something `json.dumps(..., allow_nan=False)` accepts.
+
+    Operating on values rather than DataFrames is deliberate. `df.where(notna, None)`
+    looks like it removes NaN, but on a float column pandas stores None back as NaN,
+    so the scrub silently does nothing and the NaN reaches the JSON encoder - which
+    emits a bare `NaN` token that the Gemini API rejects with a 400.
+    """
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+    if isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.isoformat()
+    if hasattr(value, "isoformat"):  # date, time, datetime
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return _clean_scalar(float(value))
+    if hasattr(value, "item"):  # numpy scalar -> python scalar, then re-check
+        try:
+            return _clean_scalar(value.item())
+        except (ValueError, AttributeError):
+            return str(value)
+    try:
+        if pd.isna(value):  # pd.NA and friends
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (list, tuple, set)):
+        return [_clean_scalar(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _clean_scalar(v) for k, v in value.items()}
+    return str(value)
+
+
+def json_safe(obj: Any) -> Any:
+    """Recursively sanitise a tool's return value before it goes back to the model."""
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    return _clean_scalar(obj)
+
+
 def _jsonable_rows(df: pd.DataFrame, limit: int) -> list[dict]:
     """Rows safe to hand back to the model: no NaN, no inf, no numpy scalars."""
-    out = df.head(limit).copy()
-    out = out.replace([float("inf"), float("-inf")], None)
-    out = out.where(pd.notna(out), None)
-    records = out.to_dict(orient="records")
-    for row in records:
-        for key, val in row.items():
-            if hasattr(val, "item"):
-                row[key] = val.item()
-            elif isinstance(val, pd.Timestamp):
-                row[key] = val.isoformat()
-    return records
+    records = df.head(limit).to_dict(orient="records")
+    return [{str(k): _clean_scalar(v) for k, v in row.items()} for row in records]
 
 
 # --------------------------------------------------------------------------------------
@@ -331,14 +623,14 @@ def preview_data_sources(tool_context: ToolContext) -> dict:
     )
 
     tool_context.state["tables"] = {t["table"]: t["columns"] for t in tables}
-    return {
+    return json_safe({
         "tables": tables,
         "note": (
             "Query these using their `table` name. The first table is also aliased as `data`."
             if len(tables) > 1
             else "Query this table by its `table` name, or as `data`."
         ),
-    }
+    })
 
 
 def run_sql_query(query: str, tool_context: ToolContext) -> dict:
@@ -387,13 +679,15 @@ def run_sql_query(query: str, tool_context: ToolContext) -> dict:
     tool_context.state["last_query"] = query.strip()
     tool_context.state["last_result_columns"] = [str(c) for c in result.columns]
 
-    return {
-        "columns": [str(c) for c in result.columns],
-        "row_count": int(len(result)),
-        "rows_preview": _jsonable_rows(result, MAX_ROWS_TO_MODEL),
-        "truncated": truncated,
-        "note": "The full result is held in memory. Pass column names to create_visualization.",
-    }
+    return json_safe(
+        {
+            "columns": [str(c) for c in result.columns],
+            "row_count": int(len(result)),
+            "rows_preview": _jsonable_rows(result, MAX_ROWS_TO_MODEL),
+            "truncated": truncated,
+            "note": "The full result is held in memory. Pass column names to create_visualization.",
+        }
+    )
 
 
 def create_visualization(
@@ -413,7 +707,9 @@ def create_visualization(
 ) -> dict:
     """Render a Plotly chart from the most recent `run_sql_query` result.
 
-    The data is read from the last SQL result automatically - do not pass rows.
+    The data is read from the last SQL result automatically - do not pass rows. If the
+    user asks to re-chart something from an earlier turn, that result is still available,
+    but re-running the query is safer if the columns you need might differ.
     Every column name you pass must exist in that result.
 
     Args:
@@ -437,7 +733,9 @@ def create_visualization(
     run = get_current_run()
     df = run.last_table
     if df is None or df.empty:
-        raise ValueError("No query result available. Call run_sql_query first.")
+        raise ValueError(
+            "No query result to chart. Call run_sql_query first, then chart its columns."
+        )
 
     df = df.copy()
     plot_type = (plot_type or "").strip().lower()
@@ -609,7 +907,7 @@ def create_visualization(
         "color": color,
         "title": title,
     }
-    return {"status": "success", "plot_type": plot_type, "points": int(len(df))}
+    return json_safe({"status": "success", "plot_type": plot_type, "points": int(len(df))})
 
 
 # --------------------------------------------------------------------------------------

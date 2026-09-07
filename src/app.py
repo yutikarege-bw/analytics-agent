@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from agent_core import (
     DEFAULT_AGENT_MODEL,
     DEFAULT_REFINE_MODEL,
+    LoadedTable,
     RunState,
     build_runner,
     describe_event,
@@ -33,7 +34,10 @@ st.set_page_config(page_title="Text to Visualization", page_icon="📊", layout=
 
 MODEL_CHOICES = [
     "gemini-flash-latest",
-    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
 ]
 
 
@@ -63,14 +67,14 @@ def get_runner(model: str, api_key_fingerprint: str):
 
 
 @st.cache_data(show_spinner=False)
-def cached_datasets(file_bytes: bytes, file_name: str) -> list[tuple[pd.DataFrame, str]]:
-    """Parse one upload into [(dataframe, sheet_name)], cached on the file's bytes."""
+def cached_datasets(file_bytes: bytes, file_name: str, auto_detect: bool) -> list[LoadedTable]:
+    """Parse one upload into tables, cached on the file's bytes."""
     suffix = os.path.splitext(file_name)[1] or ".xlsx"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
     try:
-        return load_datasets(tmp_path, file_name)
+        return load_datasets(tmp_path, file_name, auto_detect=auto_detect)
     finally:
         os.unlink(tmp_path)
 
@@ -116,7 +120,7 @@ with st.sidebar:
     )
 
     agent_model = st.selectbox("Agent model", MODEL_CHOICES, index=MODEL_CHOICES.index(DEFAULT_AGENT_MODEL) if DEFAULT_AGENT_MODEL in MODEL_CHOICES else 0)
-    use_refiner = st.toggle("Refine my question first", value=True, help="A quick Gemini pass that rewrites your question into a structured analysis prompt.")
+    use_refiner = st.toggle("Rewrite analytical questions", value=True, help="A quick Gemini pass that restructures data questions. Chit-chat and follow-ups pass through untouched.")
     refine_model = st.selectbox("Refiner model", MODEL_CHOICES, index=MODEL_CHOICES.index(DEFAULT_REFINE_MODEL) if DEFAULT_REFINE_MODEL in MODEL_CHOICES else 0, disabled=not use_refiner)
     chart_height = st.slider("Chart height (px)", 320, 900, 520, step=20)
 
@@ -127,10 +131,19 @@ with st.sidebar:
         accept_multiple_files=True,
         help="Upload several files to join across them. Every sheet in a workbook is loaded.",
     )
+    auto_detect = st.toggle(
+        "Auto-detect table layout",
+        value=True,
+        help=(
+            "Finds the real header row and splits sheets that hold several tables "
+            "side by side. Turn off to read each sheet straight through with row 1 "
+            "as the header."
+        ),
+    )
 
     st.divider()
     if st.button("Reset conversation", width="stretch"):
-        for key in ("messages", "adk_session_id", "adk_user_id"):
+        for key in ("messages", "adk_session_id", "adk_user_id", "last_result"):
             st.session_state.pop(key, None)
         st.rerun()
 
@@ -144,17 +157,24 @@ if api_key:
 # Header + data preview
 # --------------------------------------------------------------------------------------
 
-st.title("📊 Text to Visualization")
-st.caption("Ask a question about your data. The agent inspects it, writes DuckDB SQL, and charts the answer.")
+st.title("📊 Data Chat & Visualization")
+st.caption("Ask about your data in plain language. Answers come back as text, a table, or a chart — whichever fits the question.")
 
 
 def build_run_state() -> RunState:
     """Parse every upload into one RunState. Cheap: the parsing itself is cached."""
     run = RunState(chart_height=chart_height)
+    run.previous_result = st.session_state.get("last_result")
     for upload in uploads or []:
         try:
-            for frame, sheet in cached_datasets(upload.getvalue(), upload.name):
-                run.add(frame, source=upload.name, sheet=sheet)
+            for table in cached_datasets(upload.getvalue(), upload.name, auto_detect):
+                run.add(
+                    table.df,
+                    source=upload.name,
+                    sheet=table.sheet,
+                    label=table.label,
+                    note=table.note,
+                )
         except Exception as exc:  # one bad file shouldn't block the others
             st.warning(f"Couldn't read **{upload.name}**: {exc}")
     return run
@@ -170,14 +190,20 @@ if data_state.datasets:
         for tab, dataset in zip(tabs, data_state.datasets):
             with tab:
                 origin = f"{dataset.source} › {dataset.sheet}" if dataset.sheet else dataset.source
+                if dataset.label:
+                    origin += f" › “{dataset.label}”"
                 st.caption(
                     f"`FROM {dataset.table}` — {origin} — "
                     f"{len(dataset.df):,} rows × {len(dataset.df.columns)} columns"
+                    + (f"  \n_{dataset.note}_" if dataset.note else "")
                 )
                 st.dataframe(dataset.df.head(50), width="stretch")
                 st.write("**Columns:** " + ", ".join(str(c) for c in dataset.df.columns))
 else:
-    st.info("Upload one or more CSV or Excel files in the sidebar to get started.")
+    st.info(
+        "Upload one or more CSV or Excel files in the sidebar to analyse them. "
+        "You can still chat without any data loaded."
+    )
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -210,14 +236,11 @@ for i, msg in enumerate(st.session_state.messages):
 # Chat turn
 # --------------------------------------------------------------------------------------
 
-question = st.chat_input("e.g. Draw a bar chart of total revenue by channel")
+question = st.chat_input("Ask about your data, or just say hello")
 
 if question:
     if not api_key:
         st.error("Add your Gemini API key in the sidebar first.")
-        st.stop()
-    if not data_state.datasets:
-        st.error("Upload a CSV or Excel file first.")
         st.stop()
 
     st.session_state.messages.append({"role": "user", "content": question})
@@ -233,17 +256,27 @@ if question:
     with st.chat_message("assistant"):
         refined = ""
         if use_refiner:
-            with st.spinner("Refining the question..."):
-                refined = refine_prompt(question, api_key=api_key, model=refine_model)
-            with st.expander("Refined prompt"):
-                st.markdown(refined)
+            with st.spinner("Thinking about the question..."):
+                rewritten = refine_prompt(question, api_key=api_key, model=refine_model)
+            # The refiner returns chit-chat and follow-ups verbatim; only surface a
+            # rewrite when it genuinely restructured the question.
+            if rewritten.strip().lower() != question.strip().lower():
+                refined = rewritten
+                with st.expander("Rewritten as"):
+                    st.markdown(refined)
 
-        catalog = "\n".join(
-            f"- `{d.table}` (from {d.source}{' › ' + d.sheet if d.sheet else ''}): "
-            + ", ".join(str(c) for c in d.df.columns)
-            for d in run.datasets
-        )
-        prompt = f"Available tables and columns:\n{catalog}\n\n{refined or question}"
+        if run.datasets:
+            catalog = "\n".join(
+                f"- `{d.table}` (from {d.source}"
+                + (f" › {d.sheet}" if d.sheet else "")
+                + (f" › “{d.label}”" if d.label else "")
+                + "): "
+                + ", ".join(str(c) for c in d.df.columns)
+                for d in run.datasets
+            )
+            prompt = f"Tables currently loaded:\n{catalog}\n\n{refined or question}"
+        else:
+            prompt = f"No data is loaded yet.\n\n{refined or question}"
 
         status = st.status("Working...", expanded=True)
 
@@ -274,6 +307,9 @@ if question:
         for f_i, fig in enumerate(run.figures):
             st.plotly_chart(fig, width="stretch", key=f"live_fig_{len(st.session_state.messages)}_{f_i}")
         st.markdown(answer)
+
+    if run.tables:
+        st.session_state.last_result = run.tables[-1]
 
     st.session_state.messages.append(
         {
